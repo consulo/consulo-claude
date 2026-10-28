@@ -1,0 +1,58 @@
+provider.name:
+    text: Claude (CLI)
+label.api.key:
+    text: 'API key or OAuth token:'
+auth.mode.cli:
+    text: Claude command line login
+auth.mode.api.key:
+    text: API key (Anthropic Console)
+auth.mode.oauth.token:
+    text: OAuth token (claude setup-token)
+permission.mode.manual:
+    text: Ask before edits and commands
+permission.mode.accept.edits:
+    text: Accept file edits, ask before commands
+permission.mode.plan:
+    text: Plan only, change nothing
+permission.mode.auto:
+    text: Let the command line decide what is safe
+permission.mode.dont.ask:
+    text: Never ask, deny what settings do not allow
+permission.mode.bypass:
+    text: Never ask, allow everything (dangerous)
+label.sign.in.with:
+    text: 'Sign in with:'
+label.tool.permissions:
+    text: 'Tool permissions:'
+label.command.line:
+    text: 'Command line:'
+button.log.in:
+    text: Log In...
+button.log.in.tooltip:
+    text: Sign in with a Claude subscription
+button.console.log.in:
+    text: Console Log In...
+button.console.log.in.tooltip:
+    text: Sign in to the Anthropic Console, billed per use
+button.log.out:
+    text: Log Out
+status.checking:
+    text: Checking the login of the claude command line...
+status.cannot.read:
+    text: 'Cannot read the login: {0}'
+status.signed.in:
+    text: Signed in ({0})
+status.signed.in.as:
+    text: Signed in as {0} ({1})
+status.not.signed.in:
+    text: Not signed in
+status.waiting.browser:
+    text: Waiting for the sign-in in the browser...
+status.sign.in.failed:
+    text: Sign-in did not finish
+status.sign.in.failed.reason:
+    text: 'Sign-in did not finish: {0}'
+dialog.sign.in.title:
+    text: Sign in to Claude
+dialog.sign.in.prompt:
+    text: 'Sign in on the page that opened in the browser, then paste the code it shows:'

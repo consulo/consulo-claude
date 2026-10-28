@@ -1,0 +1,12 @@
+<consulo-plugin url="https://github.com/consulo/consulo-claude">
+    <id>consulo.claude</id>
+    <name>Claude</name>
+    <version>SNAPSHOT</version>
+    <vendor>consulo.io</vendor>
+    <description>Claude by Anthropic as an AI provider, through the Claude Code command line - chat in the AI Chat tool window, with tool permissions and questions answered in the IDE.</description>
+    <localize>consulo.claude.ClaudeLocalize</localize>
+
+    <tags>
+        <tag>ai</tag>
+    </tags>
+</consulo-plugin>
