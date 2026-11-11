@@ -15,11 +15,18 @@
  */
 package consulo.claude;
 
+import consulo.accountManagement.Account;
+import consulo.accountManagement.AccountAuthorizeConfig;
+import consulo.accountManagement.AccountAuthorizeType;
+import consulo.accountManagement.AccountCredentials;
+import consulo.accountManagement.AccountManager;
+import consulo.accountManagement.AccountType;
+import consulo.ai.AIChatInfo;
 import consulo.ai.AIContent;
 import consulo.ai.AIMessage;
 import consulo.ai.AIModel;
 import consulo.ai.AIProvider;
-import consulo.ai.AIProviderType;
+import consulo.ai.AIProviderTypeWithChats;
 import consulo.ai.AIRequest;
 import consulo.ai.AIResponse;
 import consulo.ai.AIRole;
@@ -31,6 +38,7 @@ import consulo.claude.localize.ClaudeLocalize;
 import consulo.disposer.Disposable;
 import consulo.localize.LocalizeValue;
 import consulo.platform.Platform;
+import consulo.project.Project;
 import consulo.process.ExecutionException;
 import consulo.process.ProcessHandlerBuilderFactory;
 import consulo.ui.Component;
@@ -56,23 +64,38 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 @ExtensionImpl
 @Singleton
-public class ClaudeAIProviderType implements AIProviderType {
+public class ClaudeAIProviderType implements AIProviderTypeWithChats {
     public static final String ID = "claude";
 
-    private static final List<AIModel> MODELS = List.of(
-        new ClaudeModel("opus", "Claude Opus", 200_000),
-        new ClaudeModel("sonnet", "Claude Sonnet", 200_000),
-        new ClaudeModel("haiku", "Claude Haiku", 200_000)
+    /**
+     * Until the command line listed its models - the aliases it always knows.
+     */
+    private static final List<AIModel> FALLBACK_MODELS = List.of(
+        new ClaudeModel(ClaudeModel.DEFAULT_ID, "Default", -1),
+        new ClaudeModel("opus", "Opus", -1),
+        new ClaudeModel("sonnet", "Sonnet", -1),
+        new ClaudeModel("haiku", "Haiku", -1)
     );
+
+    /**
+     * As much of the conversation as the command line itself titles a session from.
+     */
+    private static final int TITLE_CONTEXT_LENGTH = 1000;
 
     private final ProcessHandlerBuilderFactory myProcessHandlerBuilderFactory;
     private final ApplicationConcurrency myApplicationConcurrency;
+    private final AccountManager myAccountManager;
     private final Map<String, ClaudeCliSession> mySessions = new ConcurrentHashMap<>();
+    private volatile List<AIModel> myModels = FALLBACK_MODELS;
+    private volatile @Nullable CompletableFuture<List<AIModel>> myModelsLoading;
 
     @Inject
-    public ClaudeAIProviderType(ProcessHandlerBuilderFactory processHandlerBuilderFactory, ApplicationConcurrency applicationConcurrency) {
+    public ClaudeAIProviderType(ProcessHandlerBuilderFactory processHandlerBuilderFactory,
+                                ApplicationConcurrency applicationConcurrency,
+                                AccountManager accountManager) {
         myProcessHandlerBuilderFactory = processHandlerBuilderFactory;
         myApplicationConcurrency = applicationConcurrency;
+        myAccountManager = accountManager;
     }
 
     @Override
@@ -92,7 +115,48 @@ public class ClaudeAIProviderType implements AIProviderType {
 
     @Override
     public List<AIModel> getModels() {
-        return MODELS;
+        loadModels();
+        return myModels;
+    }
+
+    /**
+     * An alias the command line does not list - {@code opus} - is the listed model it names, {@code opus[1m]}.
+     */
+    @Override
+    public @Nullable AIModel resolveModel(List<AIModel> models, String id) {
+        AIModel model = AIProviderTypeWithChats.super.resolveModel(models, id);
+        if (model != null) {
+            return model;
+        }
+        for (AIModel candidate : models) {
+            if (candidate.getId().startsWith(id + "[")) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The command line is asked once a run - until it answers, and when it can't, the models are the fallback ones.
+     */
+    @Override
+    public CompletableFuture<List<AIModel>> loadModels() {
+        CompletableFuture<List<AIModel>> loading = myModelsLoading;
+        if (loading == null) {
+            synchronized (this) {
+                loading = myModelsLoading;
+                if (loading == null) {
+                    loading = CompletableFuture.supplyAsync(ClaudeCli::models, myApplicationConcurrency.executor()).thenApply(models -> {
+                        if (!models.isEmpty()) {
+                            myModels = List.copyOf(models);
+                        }
+                        return myModels;
+                    });
+                    myModelsLoading = loading;
+                }
+            }
+        }
+        return loading;
     }
 
     @Override
@@ -101,31 +165,63 @@ public class ClaudeAIProviderType implements AIProviderType {
     }
 
     @Override
-    public boolean acceptsApiKey() {
-        return true;
-    }
-
-    @Override
-    public LocalizeValue getApiKeyLabel() {
-        return ClaudeLocalize.labelApiKey();
+    public String getAccountTypeId() {
+        return ClaudeAccountType.ID;
     }
 
     @RequiredUIAccess
     @Override
     public @Nullable Component createAccountComponent(Map<String, String> options, Disposable uiDisposable) {
-        return new ClaudeAccountComponent(myProcessHandlerBuilderFactory, myApplicationConcurrency, options).getComponent();
+        return new ClaudeAccountComponent(options).getComponent();
     }
 
     /**
-     * Configured when the command line is there and, unless it signs in on its own, the account has its secret -
-     * whether the command line login itself is valid shows on the first answer, which carries the reason.
+     * Configured when the command line is there and the instance has an account which did not fail to sign in -
+     * whether the login of the command line itself is still valid shows on the first answer, which carries the reason.
      */
     @Override
     public CompletableFuture<Boolean> isConfigured(AIProvider provider) {
-        if (ClaudeAuthMode.of(provider) == ClaudeAuthMode.CLI) {
-            return CompletableFuture.supplyAsync(() -> ClaudeCli.findExecutable() != null, myApplicationConcurrency.executor());
+        return AIProviderTypeWithChats.super.isConfigured(provider)
+            .thenCombine(CompletableFuture.supplyAsync(() -> ClaudeCli.findExecutable() != null, myApplicationConcurrency.executor()), Boolean::logicalAnd);
+    }
+
+    /**
+     * An instance from before accounts signed in with an {@value ClaudeAuthMode#OPTION} option - the login of the
+     * command line, which becomes the account of it (one for every instance), or a secret of the password safe, which
+     * becomes an account of an API key or a token.
+     */
+    @Override
+    public CompletableFuture<@Nullable String> migrateToAccount(AIProvider provider, @Nullable String legacySecret) {
+        AccountType<?> type = myAccountManager.findAccountType(ClaudeAccountType.ID);
+        if (type == null) {
+            return CompletableFuture.completedFuture(null);
         }
-        return provider.getApiKey().thenApply(secret -> secret != null && ClaudeCli.findExecutable() != null);
+        ClaudeAuthMode mode = ClaudeAuthMode.of(provider);
+        if (mode == ClaudeAuthMode.CLI) {
+            for (Account account : myAccountManager.getAccounts(type, null)) {
+                if (ClaudeCliAuthorizeType.ID.equals(account.getAuthorizeTypeId())) {
+                    return CompletableFuture.completedFuture(account.getId());
+                }
+            }
+            return myAccountManager.addAccount(type, ClaudeCliAuthorizeConfig.INSTANCE, ClaudeCliCredentials.INSTANCE, null)
+                .thenApply(Account::getId);
+        }
+        if (legacySecret == null || legacySecret.isBlank()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        AccountAuthorizeConfig config = mode == ClaudeAuthMode.API_KEY ? ClaudeAccountType.API_KEY : ClaudeAccountType.OAUTH_TOKEN;
+        AccountAuthorizeType<?> authorizeType = myAccountManager.findAuthorizeType(config);
+        if (authorizeType == null) {
+            return CompletableFuture.completedFuture(null);
+        }
+        return addAccount(type, config, authorizeType, legacySecret.strip()).thenApply(Account::getId);
+    }
+
+    private <C extends AccountCredentials> CompletableFuture<Account> addAccount(AccountType<?> type,
+                                                                                 AccountAuthorizeConfig config,
+                                                                                 AccountAuthorizeType<C> authorizeType,
+                                                                                 String secret) {
+        return myAccountManager.addAccount(type, config, authorizeType.deserialize(secret, config), null);
     }
 
     @Override
@@ -136,9 +232,10 @@ public class ClaudeAIProviderType implements AIProviderType {
         }
 
         String sessionId = request.getSessionId();
-        return provider.getApiKey().thenApplyAsync(apiKey -> {
+        return provider.connectAccount().thenApplyAsync(connection -> {
+            ClaudeCredential credential = ClaudeCredential.of(connection);
             try {
-                return sessionId == null ? start(provider, request, apiKey) : session(provider, sessionId, request, apiKey);
+                return sessionId == null ? start(provider, request, credential, null) : session(provider, sessionId, request, credential);
             }
             catch (ExecutionException | IOException e) {
                 throw new IllegalStateException(e.getMessage(), e);
@@ -148,7 +245,29 @@ public class ClaudeAIProviderType implements AIProviderType {
             if (sessionId == null) {
                 answer.whenComplete((response, error) -> session.close());
             }
+            else if (listener != null) {
+                answer.thenAccept(response -> askTitle(session, text, response.getText(), listener));
+            }
             return answer;
+        });
+    }
+
+    /**
+     * The command line titles a session itself; once the first answer is there its title is asked for - and generated
+     * from the conversation when the session has none, as a resumed one - and kept with the session.
+     */
+    private static void askTitle(ClaudeCliSession session, String prompt, String answer, AIStreamListener listener) {
+        if (!session.askTitle()) {
+            return;
+        }
+        String description = prompt + "\n\n" + answer;
+        if (description.length() > TITLE_CONTEXT_LENGTH) {
+            description = description.substring(description.length() - TITLE_CONTEXT_LENGTH);
+        }
+        session.generateTitle(description, true).whenComplete((title, error) -> {
+            if (title != null) {
+                listener.onTitle(title);
+            }
         });
     }
 
@@ -160,14 +279,14 @@ public class ClaudeAIProviderType implements AIProviderType {
         }
     }
 
-    private ClaudeCliSession session(AIProvider provider, String sessionId, AIRequest request, @Nullable String apiKey)
+    private ClaudeCliSession session(AIProvider provider, String sessionId, AIRequest request, ClaudeCredential credential)
         throws ExecutionException, IOException {
         String key = key(provider, sessionId);
         ClaudeCliSession existing = mySessions.get(key);
         if (existing != null) {
             return existing;
         }
-        ClaudeCliSession session = start(provider, request, apiKey);
+        ClaudeCliSession session = start(provider, request, credential, sessionId);
         ClaudeCliSession raced = mySessions.putIfAbsent(key, session);
         if (raced != null) {
             session.close();
@@ -176,14 +295,16 @@ public class ClaudeAIProviderType implements AIProviderType {
         return session;
     }
 
-    private ClaudeCliSession start(AIProvider provider, AIRequest request, @Nullable String apiKey) throws ExecutionException, IOException {
+    private ClaudeCliSession start(AIProvider provider, AIRequest request, ClaudeCredential credential, @Nullable String sessionId)
+        throws ExecutionException, IOException {
         Path executable = ClaudeCli.findExecutable();
         if (executable == null) {
             throw new IOException("The claude command line was not found on the PATH");
         }
-        ClaudeModel model = request.getModel() instanceof ClaudeModel claudeModel ? claudeModel : (ClaudeModel) MODELS.getFirst();
-        ClaudeAuthMode authMode = ClaudeAuthMode.of(provider);
-        if (authMode != ClaudeAuthMode.CLI && (apiKey == null || apiKey.isBlank())) {
+        ClaudeModel model = request.getModel() instanceof ClaudeModel claudeModel ? claudeModel : (ClaudeModel) FALLBACK_MODELS.getFirst();
+        ClaudeAuthMode authMode = credential.mode();
+        String secret = credential.secret();
+        if (authMode != ClaudeAuthMode.CLI && (secret == null || secret.isBlank())) {
             throw new IOException("The account signs in with " + authMode.getDisplayName().get() + ", but it has none set");
         }
         Path workingDirectory = request.getWorkingDirectory();
@@ -193,9 +314,80 @@ public class ClaudeAIProviderType implements AIProviderType {
             model,
             workingDirectory != null ? workingDirectory : Platform.current().user().homePath(),
             authMode,
-            apiKey,
-            ClaudePermissionMode.of(provider)
+            secret,
+            ClaudePermissionMode.of(provider),
+            sessionId,
+            request.getEffort()
         );
+    }
+
+    /**
+     * The sessions the command line kept for the directory of the project - the ones started in a terminal too.
+     */
+    @Override
+    public CompletableFuture<List<AIChatInfo>> getChats(AIProvider provider, Project project) {
+        // the chat tree lists the chats first - the models are asked for then, to be there once a chat opens
+        getModels();
+        String basePath = project.getBasePath();
+        if (basePath == null) {
+            return CompletableFuture.completedFuture(List.of());
+        }
+        return CompletableFuture.supplyAsync(() -> ClaudeChats.list(Path.of(basePath)), myApplicationConcurrency.executor());
+    }
+
+    @Override
+    public CompletableFuture<@Nullable AIChatInfo> getChat(AIProvider provider, Project project, String chatId) {
+        return CompletableFuture.supplyAsync(() -> ClaudeChats.find(chatId), myApplicationConcurrency.executor());
+    }
+
+    @Override
+    public CompletableFuture<List<AIMessage>> loadChat(AIProvider provider, Project project, String chatId) {
+        return CompletableFuture.supplyAsync(() -> ClaudeChats.load(chatId), myApplicationConcurrency.executor());
+    }
+
+    /**
+     * A running session is renamed by the command line itself; one which does not run is named in its file.
+     */
+    @Override
+    public CompletableFuture<?> renameChat(AIProvider provider, Project project, String chatId, String title) {
+        ClaudeCliSession session = mySessions.get(key(provider, chatId));
+        if (session != null) {
+            return session.rename(title);
+        }
+        return CompletableFuture.runAsync(() -> {
+            try {
+                ClaudeChats.rename(chatId, title);
+            }
+            catch (IOException e) {
+                throw new IllegalStateException(e.getMessage(), e);
+            }
+        }, myApplicationConcurrency.executor());
+    }
+
+    /**
+     * The user deletes the chat with its history - the session file of the command line goes with it.
+     */
+    @Override
+    public CompletableFuture<?> deleteChat(AIProvider provider, Project project, String chatId) {
+        closeAll(chatId);
+        return CompletableFuture.runAsync(() -> {
+            try {
+                ClaudeChats.delete(chatId);
+            }
+            catch (IOException e) {
+                throw new IllegalStateException(e.getMessage(), e);
+            }
+        }, myApplicationConcurrency.executor());
+    }
+
+    private void closeAll(String sessionId) {
+        mySessions.entrySet().removeIf(entry -> {
+            if (entry.getKey().endsWith("/" + sessionId)) {
+                entry.getValue().close();
+                return true;
+            }
+            return false;
+        });
     }
 
     private static String key(AIProvider provider, String sessionId) {

@@ -23,7 +23,9 @@ import org.jspecify.annotations.Nullable;
 import java.util.Map;
 
 /**
- * How a Claude account signs the command line in. Kept as the {@value #OPTION} option of the account.
+ * How the command line is signed in - its own login, an API key or an OAuth token, each passed its own way. Instances
+ * from before accounts kept it as the {@value #OPTION} option, which {@link ClaudeAIProviderType#migrateToAccount}
+ * reads.
  *
  * @author VISTALL
  * @since 2026-10-13
@@ -63,10 +65,6 @@ enum ClaudeAuthMode {
      */
     @Nullable String getEnvironmentVariable() {
         return myEnvironmentVariable;
-    }
-
-    void store(Map<String, String> options) {
-        options.put(OPTION, myId);
     }
 
     static ClaudeAuthMode of(AIProvider provider) {

@@ -15,62 +15,27 @@
  */
 package consulo.claude;
 
-import consulo.application.concurrent.ApplicationConcurrency;
 import consulo.claude.localize.ClaudeLocalize;
 import consulo.localize.LocalizeValue;
-import consulo.process.ProcessHandlerBuilderFactory;
-import consulo.ui.Button;
 import consulo.ui.ComboBox;
 import consulo.ui.Component;
 import consulo.ui.Label;
-import consulo.ui.UIAccess;
 import consulo.ui.annotation.RequiredUIAccess;
 import consulo.ui.layout.DockLayout;
-import consulo.ui.layout.HorizontalLayout;
-import consulo.ui.layout.VerticalLayout;
 
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
 
 /**
- * How a Claude account signs in - the login of the command line, an API key or an OAuth token - and the login of the
- * command line itself: what it is signed in as, and the buttons to sign in or out.
+ * What a Claude instance lets the command line do without asking. How it signs in is its account, chosen above.
  *
  * @author VISTALL
  * @since 2026-10-13
  */
 final class ClaudeAccountComponent {
-    private final ProcessHandlerBuilderFactory myProcessHandlerBuilderFactory;
-    private final ApplicationConcurrency myApplicationConcurrency;
-    private final UIAccess myUIAccess;
-
-    private final Label myStatus = Label.create(ClaudeLocalize.statusChecking());
-    private final Button myLogin;
-    private final Button myConsoleLogin;
-    private final Button myLogout;
-    private final VerticalLayout myRoot = VerticalLayout.create();
-    private final VerticalLayout myCliLogin = VerticalLayout.create();
+    private final DockLayout myRoot;
 
     @RequiredUIAccess
-    ClaudeAccountComponent(ProcessHandlerBuilderFactory processHandlerBuilderFactory,
-                           ApplicationConcurrency applicationConcurrency,
-                           Map<String, String> options) {
-        myProcessHandlerBuilderFactory = processHandlerBuilderFactory;
-        myApplicationConcurrency = applicationConcurrency;
-        myUIAccess = UIAccess.current();
-
-        ComboBox<ClaudeAuthMode> modeBox = ComboBox.create(ClaudeAuthMode.values());
-        modeBox.setTextRenderer(mode -> mode == null ? LocalizeValue.empty() : mode.getDisplayName());
-        modeBox.setValue(ClaudeAuthMode.of(options));
-        modeBox.addValueListener(event -> {
-            ClaudeAuthMode mode = event.getValue();
-            if (mode != null) {
-                mode.store(options);
-            }
-            myCliLogin.setVisible(mode == ClaudeAuthMode.CLI);
-        });
-        myRoot.add(DockLayout.create().left(Label.create(ClaudeLocalize.labelSignInWith())).right(modeBox));
-
+    ClaudeAccountComponent(Map<String, String> options) {
         ComboBox<ClaudePermissionMode> permissionBox = ComboBox.create(ClaudePermissionMode.values());
         permissionBox.setTextRenderer(mode -> mode == null ? LocalizeValue.empty() : mode.getDisplayName());
         permissionBox.setValue(ClaudePermissionMode.of(options));
@@ -80,84 +45,10 @@ final class ClaudeAccountComponent {
                 mode.store(options);
             }
         });
-        myRoot.add(DockLayout.create().left(Label.create(ClaudeLocalize.labelToolPermissions())).right(permissionBox));
-
-        myLogin = Button.create(ClaudeLocalize.buttonLogIn(), event -> login(false));
-        myLogin.setToolTipText(ClaudeLocalize.buttonLogInTooltip());
-        myConsoleLogin = Button.create(ClaudeLocalize.buttonConsoleLogIn(), event -> login(true));
-        myConsoleLogin.setToolTipText(ClaudeLocalize.buttonConsoleLogInTooltip());
-        myLogout = Button.create(ClaudeLocalize.buttonLogOut(), event -> logout());
-
-        myCliLogin.add(DockLayout.create().left(Label.create(ClaudeLocalize.labelCommandLine())).right(myStatus));
-        myCliLogin.add(DockLayout.create().right(HorizontalLayout.create().add(myLogin).add(myConsoleLogin).add(myLogout)));
-        myCliLogin.setVisible(ClaudeAuthMode.of(options) == ClaudeAuthMode.CLI);
-        myRoot.add(myCliLogin);
-
-        refresh();
+        myRoot = DockLayout.create().left(Label.create(ClaudeLocalize.labelToolPermissions())).right(permissionBox);
     }
 
     Component getComponent() {
         return myRoot;
-    }
-
-    @RequiredUIAccess
-    private void refresh() {
-        setBusy(true);
-        CompletableFuture.supplyAsync(ClaudeCli::status, myApplicationConcurrency.executor())
-            .whenCompleteAsync((status, error) -> {
-                setBusy(false);
-                if (status == null) {
-                    myStatus.setText(ClaudeLocalize.statusCannotRead(error == null ? "" : String.valueOf(error.getMessage())));
-                    return;
-                }
-                if (status.error() != null) {
-                    myStatus.setText(LocalizeValue.of(status.error()));
-                }
-                else if (status.loggedIn()) {
-                    String account = status.account();
-                    myStatus.setText(account == null
-                        ? ClaudeLocalize.statusSignedIn(status.authMethod())
-                        : ClaudeLocalize.statusSignedInAs(account, status.authMethod()));
-                }
-                else {
-                    myStatus.setText(ClaudeLocalize.statusNotSignedIn());
-                }
-                myLogout.setEnabled(status.loggedIn());
-            }, myUIAccess);
-    }
-
-    @RequiredUIAccess
-    private void login(boolean console) {
-        setBusy(true);
-        myStatus.setText(ClaudeLocalize.statusWaitingBrowser());
-        ClaudeCliLogin.start(myProcessHandlerBuilderFactory, myUIAccess, myRoot, console)
-            .whenCompleteAsync((exitCode, error) -> {
-                setBusy(false);
-                if (error != null || exitCode == null || exitCode != 0) {
-                    myStatus.setText((error == null ? ClaudeLocalize.statusSignInFailed() : ClaudeLocalize.statusSignInFailedReason(String.valueOf(error.getMessage()))));
-                    return;
-                }
-                refresh();
-            }, myUIAccess);
-    }
-
-    @RequiredUIAccess
-    private void logout() {
-        setBusy(true);
-        CompletableFuture.runAsync(() -> {
-            try {
-                ClaudeCli.logout();
-            }
-            catch (Exception e) {
-                throw new IllegalStateException(e.getMessage(), e);
-            }
-        }, myApplicationConcurrency.executor()).whenCompleteAsync((ignored, error) -> refresh(), myUIAccess);
-    }
-
-    @RequiredUIAccess
-    private void setBusy(boolean busy) {
-        myLogin.setEnabled(!busy);
-        myConsoleLogin.setEnabled(!busy);
-        myLogout.setEnabled(!busy);
     }
 }

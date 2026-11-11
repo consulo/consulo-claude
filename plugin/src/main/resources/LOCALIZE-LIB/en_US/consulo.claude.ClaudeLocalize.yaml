@@ -56,3 +56,23 @@ dialog.sign.in.title:
     text: Sign in to Claude
 dialog.sign.in.prompt:
     text: 'Sign in on the page that opened in the browser, then paste the code it shows:'
+account.type.name:
+    text: Claude
+account.name.cli:
+    text: Claude Code login
+account.name.api.key:
+    text: Anthropic API key
+account.name.oauth.token:
+    text: Claude subscription token
+error.not.signed.in:
+    text: The claude command line is not signed in - log in first
+effort.low:
+    text: Low
+effort.medium:
+    text: Medium
+effort.high:
+    text: High
+effort.xhigh:
+    text: Extra high
+effort.max:
+    text: Max

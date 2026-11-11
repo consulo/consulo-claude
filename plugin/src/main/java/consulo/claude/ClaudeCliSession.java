@@ -42,7 +42,10 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * One conversation with the claude command line: a single long-lived {@code claude -p} process speaking stream-json,
@@ -67,13 +70,18 @@ class ClaudeCliSession {
 
     private @Nullable Turn myTurn;
     private @Nullable String myCliSessionId;
+    private final Map<String, CompletableFuture<JsonObject>> myControlRequests = new ConcurrentHashMap<>();
+    private boolean myTitleAsked;
 
     private ClaudeCliSession(ProcessHandler handler) {
         myHandler = handler;
     }
 
     /**
-     * @param secret the API key or the OAuth token of the account, passed the way {@code authMode} says
+     * @param secret    the API key or the OAuth token of the account, passed the way {@code authMode} says
+     * @param sessionId the id of the conversation - the command line resumes it when it kept it, and starts it under
+     *                  this id otherwise, so the chat of the IDE and the session of the command line are one; null for
+     *                  a one-off request
      */
     static ClaudeCliSession start(ProcessHandlerBuilderFactory factory,
                                   Path executable,
@@ -81,7 +89,9 @@ class ClaudeCliSession {
                                   Path workDirectory,
                                   ClaudeAuthMode authMode,
                                   @Nullable String secret,
-                                  ClaudePermissionMode permissionMode) throws ExecutionException {
+                                  ClaudePermissionMode permissionMode,
+                                  @Nullable String sessionId,
+                                  @Nullable String effort) throws ExecutionException {
         List<String> parameters = new ArrayList<>(List.of(
             "-p",
             "--input-format", "stream-json",
@@ -91,8 +101,18 @@ class ClaudeCliSession {
             "--permission-prompt-tool", "stdio"
         ));
         parameters.addAll(permissionMode.getParameters());
-        parameters.add("--model");
-        parameters.add(model.id());
+        if (!ClaudeModel.DEFAULT_ID.equals(model.id())) {
+            parameters.add("--model");
+            parameters.add(model.id());
+        }
+        if (effort != null && !effort.isBlank()) {
+            parameters.add("--effort");
+            parameters.add(effort);
+        }
+        if (sessionId != null) {
+            parameters.add(ClaudeChats.exists(workDirectory, sessionId) ? "--resume" : "--session-id");
+            parameters.add(sessionId);
+        }
 
         GeneralCommandLine commandLine = new GeneralCommandLine()
             .withExecutablePath(executable)
@@ -230,9 +250,90 @@ class ClaudeCliSession {
             case "result" -> onResult(event);
             case "control_request" -> myControlHandler.onRequest(event);
             case "control_cancel_request" -> myControlHandler.onCancel(event);
+            case "control_response" -> onControlResponse(event.getAsJsonObject("response"));
             default -> {
             }
         }
+    }
+
+    /**
+     * The title the command line keeps for the session, generated from {@code description} when it has none yet - it
+     * titles a new session itself a few seconds after the first prompt, and answers once that title is there. With
+     * {@code persist} the title is stored with the session as an {@code ai-title} record. Null when it has no title to
+     * give.
+     */
+    CompletableFuture<@Nullable String> generateTitle(String description, boolean persist) {
+        JsonObject request = new JsonObject();
+        request.addProperty("subtype", "generate_session_title");
+        request.addProperty("description", description);
+        request.addProperty("persist", persist);
+        return controlRequest(request).thenApply(response -> {
+            JsonElement title = response.get("title");
+            return title == null || !title.isJsonPrimitive() || title.getAsString().isBlank() ? null : title.getAsString();
+        });
+    }
+
+    /**
+     * True the first time only - the title of a session is asked for once a process.
+     */
+    synchronized boolean askTitle() {
+        boolean first = !myTitleAsked;
+        myTitleAsked = true;
+        return first;
+    }
+
+    /**
+     * Names the session the way the command line does for {@code /rename}.
+     */
+    CompletableFuture<?> rename(String title) {
+        JsonObject request = new JsonObject();
+        request.addProperty("subtype", "rename_session");
+        request.addProperty("title", title);
+        request.addProperty("source", "host");
+        String sessionId = myCliSessionId;
+        if (sessionId != null) {
+            request.addProperty("session_id", sessionId);
+        }
+        return controlRequest(request);
+    }
+
+    /**
+     * A control request of ours, answered by a {@code control_response} with the same id.
+     */
+    private CompletableFuture<JsonObject> controlRequest(JsonObject request) {
+        String requestId = "consulo-" + UUID.randomUUID();
+        CompletableFuture<JsonObject> response = new CompletableFuture<>();
+        myControlRequests.put(requestId, response);
+
+        JsonObject line = new JsonObject();
+        line.addProperty("type", "control_request");
+        line.addProperty("request_id", requestId);
+        line.add("request", request);
+        try {
+            write(line);
+        }
+        catch (IOException e) {
+            myControlRequests.remove(requestId);
+            response.completeExceptionally(e);
+        }
+        return response;
+    }
+
+    private void onControlResponse(@Nullable JsonObject response) {
+        if (response == null) {
+            return;
+        }
+        CompletableFuture<JsonObject> pending = myControlRequests.remove(string(response, "request_id"));
+        if (pending == null) {
+            return;
+        }
+        if ("error".equals(string(response, "subtype"))) {
+            String error = string(response, "error");
+            pending.completeExceptionally(new IOException(error.isEmpty() ? "claude refused the request" : error));
+            return;
+        }
+        JsonElement body = response.get("response");
+        pending.complete(body != null && body.isJsonObject() ? body.getAsJsonObject() : new JsonObject());
     }
 
     private void onStreamEvent(@Nullable JsonObject event) {
@@ -287,6 +388,11 @@ class ClaudeCliSession {
 
     private void onTerminated(int exitCode) {
         myControlHandler.cancelAll();
+        IOException exited = new IOException("claude exited with " + exitCode);
+        for (CompletableFuture<JsonObject> pending : myControlRequests.values()) {
+            pending.completeExceptionally(exited);
+        }
+        myControlRequests.clear();
         Turn turn;
         synchronized (this) {
             turn = myTurn;

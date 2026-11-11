@@ -15,10 +15,13 @@
  */
 package consulo.claude;
 
+import consulo.ai.AIEffortLevel;
 import consulo.ai.AIModel;
 import consulo.ai.AIModelCapability;
+import consulo.claude.localize.ClaudeLocalize;
 import consulo.localize.LocalizeValue;
 
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -27,7 +30,35 @@ import java.util.Set;
  * @author VISTALL
  * @since 2026-10-13
  */
-record ClaudeModel(String id, String displayName, int contextWindow) implements AIModel {
+record ClaudeModel(String id, String displayName, String description, int contextWindow, List<AIEffortLevel> effortLevels)
+    implements AIModel {
+    /**
+     * Leaves the choice to the command line and the account - no {@code --model} is passed.
+     */
+    static final String DEFAULT_ID = "default";
+
+    ClaudeModel(String id, String displayName, int contextWindow) {
+        this(id, displayName, "", contextWindow, List.of());
+    }
+
+    /**
+     * The levels as {@code --effort} takes them, named for the user.
+     */
+    static List<AIEffortLevel> effortLevels(List<String> ids) {
+        return ids.stream().map(id -> new AIEffortLevel(id, effortName(id))).toList();
+    }
+
+    private static LocalizeValue effortName(String id) {
+        return switch (id) {
+            case "low" -> ClaudeLocalize.effortLow();
+            case "medium" -> ClaudeLocalize.effortMedium();
+            case "high" -> ClaudeLocalize.effortHigh();
+            case "xhigh" -> ClaudeLocalize.effortXhigh();
+            case "max" -> ClaudeLocalize.effortMax();
+            default -> LocalizeValue.of(id);
+        };
+    }
+
     @Override
     public String getId() {
         return id;
@@ -44,8 +75,18 @@ record ClaudeModel(String id, String displayName, int contextWindow) implements 
     }
 
     @Override
+    public LocalizeValue getDescription() {
+        return LocalizeValue.of(description);
+    }
+
+    @Override
     public int getContextWindow() {
         return contextWindow;
+    }
+
+    @Override
+    public List<AIEffortLevel> getEffortLevels() {
+        return effortLevels;
     }
 
     @Override
