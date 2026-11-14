@@ -83,9 +83,10 @@ class ClaudeCliSession {
                         StringBuilder text,
                         StringBuilder thinking,
                         Map<String, AIContent.ToolCall> toolCalls,
-                        Map<String, String> toolNames) {
+                        Map<String, String> toolNames,
+                        Map<Integer, ClaudePartialToolUse> partials) {
         Turn(CompletableFuture<AIResponse> result, @Nullable AIStreamListener listener) {
-            this(result, listener, new StringBuilder(), new StringBuilder(), new LinkedHashMap<>(), new ConcurrentHashMap<>());
+            this(result, listener, new StringBuilder(), new StringBuilder(), new LinkedHashMap<>(), new ConcurrentHashMap<>(), new ConcurrentHashMap<>());
         }
     }
 
@@ -380,7 +381,7 @@ class ClaudeCliSession {
                     onTaskSummary(string(event, "detail"));
                 }
             }
-            case "stream_event" -> onStreamEvent(event.getAsJsonObject("event"));
+            case "stream_event" -> onStreamEvent(event.getAsJsonObject("event"), string(event, "parent_tool_use_id"));
             case "assistant" -> onAssistant(event);
             case "user" -> onUser(event);
             case "result" -> onResult(event);
@@ -434,6 +435,21 @@ class ClaudeCliSession {
     }
 
     /**
+     * Shows the tool call as far as it arrived - again only when its title changed, not on every piece of its input.
+     */
+    private void showPartial(ClaudePartialToolUse partial, @Nullable AIStreamListener listener) {
+        if (listener == null || partial.myId.isEmpty()) {
+            return;
+        }
+        AIContent.ToolCall call = ClaudeToolCalls.partial(partial.myId, partial.myName, partial.myInput.toString(), partial.myParentId, myWorkingDirectory);
+        if (call.title().equals(partial.myShownTitle)) {
+            return;
+        }
+        partial.myShownTitle = call.title();
+        listener.onToolCall(call);
+    }
+
+    /**
      * Switches the permission mode of the running session - the plan mode, for one.
      */
     CompletableFuture<?> setPermissionMode(ClaudePermissionMode mode) {
@@ -482,17 +498,40 @@ class ClaudeCliSession {
         pending.complete(body != null && body.isJsonObject() ? body.getAsJsonObject() : new JsonObject());
     }
 
-    private void onStreamEvent(@Nullable JsonObject event) {
+    private void onStreamEvent(@Nullable JsonObject event, String parentId) {
         Turn turn = myTurn;
-        if (turn == null || event == null || !"content_block_delta".equals(string(event, "type"))) {
+        if (turn == null || event == null) {
+            return;
+        }
+        AIStreamListener listener = turn.listener();
+        int index = event.has("index") && event.get("index").isJsonPrimitive() ? event.get("index").getAsInt() : -1;
+        // a tool call shows while the model writes it - the whole call replaces it once it arrives
+        if ("content_block_start".equals(string(event, "type"))) {
+            JsonObject block = event.get("content_block") instanceof JsonObject object ? object : null;
+            String name = block == null ? "" : string(block, "name");
+            if (block != null && "tool_use".equals(string(block, "type")) && !name.isEmpty()
+                && !ClaudeToolCalls.PLAN_TOOLS.contains(name) && !ClaudeToolCalls.HIDDEN_TOOLS.contains(name)) {
+                ClaudePartialToolUse partial = new ClaudePartialToolUse(string(block, "id"), name, parentId.isEmpty() ? null : parentId);
+                turn.partials().put(index, partial);
+                showPartial(partial, listener);
+            }
+            return;
+        }
+        if (!"content_block_delta".equals(string(event, "type"))) {
             return;
         }
         JsonObject delta = event.getAsJsonObject("delta");
         if (delta == null) {
             return;
         }
-        AIStreamListener listener = turn.listener();
         switch (string(delta, "type")) {
+            case "input_json_delta" -> {
+                ClaudePartialToolUse partial = turn.partials().get(index);
+                if (partial != null) {
+                    partial.myInput.append(string(delta, "partial_json"));
+                    showPartial(partial, listener);
+                }
+            }
             case "text_delta" -> {
                 String text = string(delta, "text");
                 turn.text().append(text);

@@ -29,6 +29,9 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import com.google.gson.JsonParser;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * The tools the command line runs, as tool calls of the chat - a {@code tool_use} block starts one, the
@@ -46,6 +49,10 @@ final class ClaudeToolCalls {
      * Tools of the command line itself which do nothing for the user to see.
      */
     static final Set<String> HIDDEN_TOOLS = Set.of("ToolSearch");
+    /**
+     * A string field of a JSON object which ended - its closing quote arrived.
+     */
+    private static final Pattern PARTIAL_FIELD = Pattern.compile("\"([A-Za-z_]+)\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
 
     private static final int MAX_OUTPUT_LENGTH = 4000;
 
@@ -55,6 +62,42 @@ final class ClaudeToolCalls {
     /**
      * A call as the model asked for it - running until its result comes.
      */
+    /**
+     * A tool call while the model still writes its input - its title from what of the input arrived, no content yet.
+     */
+    static AIContent.ToolCall partial(String id, String name, String partialInput, @Nullable String parentId, Path workingDirectory) {
+        JsonObject input = partialInput(partialInput);
+        String path = string(input, "file_path").isEmpty() ? string(input, "notebook_path") : string(input, "file_path");
+        return new AIContent.ToolCall(
+            id,
+            parentId,
+            title(name, input, path, workingDirectory),
+            kind(name),
+            AIToolCallStatus.IN_PROGRESS,
+            path.isEmpty() ? List.of() : List.of(path),
+            List.of(),
+            input.toString(),
+            ""
+        );
+    }
+
+    /**
+     * The string fields of an input which arrived whole so far - the input as a whole is not JSON until it ends.
+     */
+    static JsonObject partialInput(String json) {
+        JsonObject input = new JsonObject();
+        Matcher matcher = PARTIAL_FIELD.matcher(json);
+        while (matcher.find()) {
+            try {
+                input.addProperty(matcher.group(1), JsonParser.parseString("\"" + matcher.group(2) + "\"").getAsString());
+            }
+            catch (RuntimeException ignored) {
+                // an escape cut in the middle - the field shows once more of it arrived
+            }
+        }
+        return input;
+    }
+
     static AIContent.ToolCall started(JsonObject toolUse, @Nullable String parentId, Path workingDirectory) {
         String name = string(toolUse, "name");
         JsonObject input = object(toolUse, "input");
