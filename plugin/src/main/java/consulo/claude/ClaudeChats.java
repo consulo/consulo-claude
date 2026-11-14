@@ -188,6 +188,10 @@ final class ClaudeChats {
             AIMessage last = turns.isEmpty() ? null : turns.getLast();
             if (last != null && last.role() == AIRole.ASSISTANT && message.role() == AIRole.ASSISTANT) {
                 List<AIContent> content = new ArrayList<>(last.content());
+                // the texts of two requests are two paragraphs - the answer joins its texts as they are
+                if (content.getLast() instanceof AIContent.Text && message.content().getFirst() instanceof AIContent.Text) {
+                    content.add(AIContent.text("\n\n"));
+                }
                 content.addAll(message.content());
                 turns.set(turns.size() - 1, new AIMessage(AIRole.ASSISTANT, content));
             }
@@ -303,7 +307,7 @@ final class ClaudeChats {
      * A message the user wrote - not one the command line writes itself, as the results of tools.
      */
     private static boolean isPrompt(JsonObject record) {
-        if (!"user".equals(string(record, "type")) || isSidechain(record) || bool(record, "isMeta")) {
+        if (!"user".equals(string(record, "type")) || isSidechain(record) || bool(record, "isMeta") || isSystemPrompt(record)) {
             return false;
         }
         JsonElement message = record.get("message");
@@ -469,9 +473,16 @@ final class ClaudeChats {
         }
     }
 
+    /**
+     * A prompt the command line wrote itself - the end of a command it ran in the background, for one.
+     */
+    private static boolean isSystemPrompt(JsonObject record) {
+        return "system".equals(string(record, "promptSource"));
+    }
+
     private static @Nullable AIMessage message(JsonObject record) {
         String type = string(record, "type");
-        if (!"user".equals(type) && !"assistant".equals(type) || isSidechain(record) || bool(record, "isMeta")) {
+        if (!"user".equals(type) && !"assistant".equals(type) || isSidechain(record) || bool(record, "isMeta") || isSystemPrompt(record)) {
             return null;
         }
         JsonElement messageElement = record.get("message");
