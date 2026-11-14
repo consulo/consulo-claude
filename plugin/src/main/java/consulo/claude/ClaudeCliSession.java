@@ -111,9 +111,19 @@ class ClaudeCliSession {
     private final Map<String, CompletableFuture<JsonObject>> myControlRequests = new ConcurrentHashMap<>();
     private boolean myTitleAsked;
 
-    private ClaudeCliSession(ProcessHandler handler, Path workingDirectory) {
+    private final boolean myThinking;
+
+    private ClaudeCliSession(ProcessHandler handler, Path workingDirectory, boolean thinking) {
         myHandler = handler;
         myWorkingDirectory = workingDirectory;
+        myThinking = thinking;
+    }
+
+    /**
+     * Whether the process was started to think before it answers.
+     */
+    boolean isThinking() {
+        return myThinking;
     }
 
     /**
@@ -130,7 +140,8 @@ class ClaudeCliSession {
                                   @Nullable String secret,
                                   ClaudePermissionMode permissionMode,
                                   @Nullable String sessionId,
-                                  @Nullable String effort) throws ExecutionException {
+                                  @Nullable String effort,
+                                  boolean thinking) throws ExecutionException {
         List<String> parameters = new ArrayList<>(List.of(
             "-p",
             "--input-format", "stream-json",
@@ -148,6 +159,9 @@ class ClaudeCliSession {
             parameters.add("--effort");
             parameters.add(effort);
         }
+        // the command line has no switch for thinking - its setting is given as settings of this process only
+        parameters.add("--settings");
+        parameters.add("{\"alwaysThinkingEnabled\": " + thinking + "}");
         boolean resumed = sessionId != null && ClaudeChats.exists(workDirectory, sessionId);
         if (sessionId != null) {
             parameters.add(resumed ? "--resume" : "--session-id");
@@ -170,7 +184,7 @@ class ClaudeCliSession {
         }
 
         ProcessHandler handler = factory.newBuilder(commandLine).killable().silentReader().build();
-        ClaudeCliSession session = new ClaudeCliSession(handler, workDirectory);
+        ClaudeCliSession session = new ClaudeCliSession(handler, workDirectory, thinking);
         session.myFresh = sessionId != null && !resumed;
         handler.addProcessListener(new ProcessListener() {
             @Override

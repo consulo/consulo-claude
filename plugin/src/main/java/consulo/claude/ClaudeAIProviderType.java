@@ -75,6 +75,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 @Singleton
 public class ClaudeAIProviderType implements AIProviderTypeWithChats {
     private static final String MODE_OPTION = "mode";
+    private static final String THINKING_OPTION = "thinking";
 
     public static final String ID = "claude";
 
@@ -112,6 +113,10 @@ public class ClaudeAIProviderType implements AIProviderTypeWithChats {
      * The permission mode a chat chose - the account's until it chooses one.
      */
     private final Map<String, ClaudePermissionMode> myModes = new ConcurrentHashMap<>();
+    /**
+     * Whether a chat thinks - the default of the command line until it chooses.
+     */
+    private final Map<String, Boolean> myThinking = new ConcurrentHashMap<>();
     private volatile List<AIModel> myModels = FALLBACK_MODELS;
     private volatile @Nullable CompletableFuture<List<AIModel>> myModelsLoading;
 
@@ -341,6 +346,11 @@ public class ClaudeAIProviderType implements AIProviderTypeWithChats {
         }
     }
 
+    private boolean isThinking(AIProvider provider, String sessionId) {
+        Boolean thinking = myThinking.get(key(provider, sessionId));
+        return thinking != null ? thinking : ClaudeCli.isThinkingByDefault();
+    }
+
     /**
      * The permission mode as the mode of the chat - plan mode included.
      */
@@ -351,8 +361,16 @@ public class ClaudeAIProviderType implements AIProviderTypeWithChats {
         for (ClaudePermissionMode mode : ClaudePermissionMode.values()) {
             values.add(new AISessionOptionValue(mode.getId(), mode.getShortName().get(), mode.getDisplayName().get()));
         }
-        return List.of(new AISessionOption(MODE_OPTION, ClaudeLocalize.optionMode().get(), null, AISessionOption.CATEGORY_MODE,
-            "select", current.getId(), values));
+        boolean thinking = isThinking(provider, sessionId);
+        return List.of(
+            new AISessionOption(MODE_OPTION, ClaudeLocalize.optionMode().get(), null, AISessionOption.CATEGORY_MODE,
+                "select", current.getId(), values),
+            new AISessionOption(THINKING_OPTION, ClaudeLocalize.optionThinking().get(), ClaudeLocalize.optionThinkingDescription().get(),
+                AISessionOption.CATEGORY_THOUGHT_LEVEL, "boolean", String.valueOf(thinking), List.of(
+                    new AISessionOptionValue("true", ClaudeLocalize.optionThinkingOn().get(), null),
+                    new AISessionOptionValue("false", ClaudeLocalize.optionThinkingOff().get(), null)
+                ))
+        );
     }
 
     /**
@@ -360,10 +378,19 @@ public class ClaudeAIProviderType implements AIProviderTypeWithChats {
      */
     @Override
     public CompletableFuture<List<AISessionOption>> setSessionOption(AIProvider provider, String sessionId, String optionId, String value) {
+        String key = key(provider, sessionId);
+        if (THINKING_OPTION.equals(optionId)) {
+            // the process thinks as it was started - the next prompt starts it again when it does not
+            myThinking.put(key, Boolean.parseBoolean(value));
+            List<AISessionOption> options = getSessionOptions(provider, sessionId);
+            for (AIChatSessionListener listener : mySessionListeners.getOrDefault(key, List.of())) {
+                listener.optionsChanged(options);
+            }
+            return CompletableFuture.completedFuture(options);
+        }
         if (!MODE_OPTION.equals(optionId)) {
             return AIProviderTypeWithChats.super.setSessionOption(provider, sessionId, optionId, value);
         }
-        String key = key(provider, sessionId);
         ClaudePermissionMode mode = ClaudePermissionMode.ofId(value);
         ClaudeCliSession session = mySessions.get(key);
         CompletableFuture<?> applied = session == null ? CompletableFuture.completedFuture(null) : session.setPermissionMode(mode);
@@ -402,8 +429,11 @@ public class ClaudeAIProviderType implements AIProviderTypeWithChats {
         throws ExecutionException, IOException {
         String key = key(provider, sessionId);
         ClaudeCliSession existing = mySessions.get(key);
-        if (existing != null) {
+        if (existing != null && existing.isThinking() == isThinking(provider, sessionId)) {
             return existing;
+        }
+        if (existing != null && mySessions.remove(key, existing)) {
+            existing.close();
         }
         ClaudeCliSession session = start(provider, request, credential, sessionId);
         ClaudeCliSession raced = mySessions.putIfAbsent(key, session);
@@ -436,7 +466,8 @@ public class ClaudeAIProviderType implements AIProviderTypeWithChats {
             secret,
             sessionId == null ? ClaudePermissionMode.of(provider) : myModes.getOrDefault(key(provider, sessionId), ClaudePermissionMode.of(provider)),
             sessionId,
-            request.getEffort()
+            request.getEffort(),
+            sessionId == null ? ClaudeCli.isThinkingByDefault() : isThinking(provider, sessionId)
         );
     }
 

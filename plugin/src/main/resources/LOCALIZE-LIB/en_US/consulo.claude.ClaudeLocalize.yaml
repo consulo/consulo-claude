@@ -78,6 +78,14 @@ effort.max:
     text: Max
 option.mode:
     text: Mode
+option.thinking:
+    text: Thinking
+option.thinking.description:
+    text: Whether the model thinks before it answers - the next message starts the command line again when this changes
+option.thinking.on:
+    text: 'On'
+option.thinking.off:
+    text: 'Off'
 permission.mode.manual.short:
     text: Ask
 permission.mode.accept.edits.short:

@@ -30,6 +30,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -47,6 +48,33 @@ final class ClaudeCli {
     static final String EXECUTABLE = "claude";
 
     private static final int TIMEOUT_MILLIS = 20_000;
+
+    private static volatile @Nullable Boolean ourThinkingByDefault;
+
+    /**
+     * Whether the command line thinks before it answers when nothing asks otherwise - on, unless the settings of the
+     * user turned {@code alwaysThinkingEnabled} off.
+     */
+    static boolean isThinkingByDefault() {
+        Boolean thinking = ourThinkingByDefault;
+        if (thinking == null) {
+            thinking = readThinkingByDefault();
+            ourThinkingByDefault = thinking;
+        }
+        return thinking;
+    }
+
+    private static boolean readThinkingByDefault() {
+        Path settings = Platform.current().user().homePath().resolve(".claude").resolve("settings.json");
+        try {
+            JsonElement element = JsonParser.parseString(Files.readString(settings));
+            JsonElement thinking = element.isJsonObject() ? element.getAsJsonObject().get("alwaysThinkingEnabled") : null;
+            return thinking == null || !thinking.isJsonPrimitive() || thinking.getAsBoolean();
+        }
+        catch (IOException | RuntimeException e) {
+            return true;
+        }
+    }
 
     static @Nullable Path findExecutable() {
         return Platform.current().findExecutableInPath(EXECUTABLE);
