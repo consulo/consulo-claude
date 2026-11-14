@@ -71,6 +71,8 @@ import java.util.regex.Matcher;
  * @since 2026-10-13
  */
 class ClaudeCliSession {
+    private static final String EXIT_PLAN_MODE = "ExitPlanMode";
+
     private static final Logger LOG = Logger.getInstance(ClaudeCliSession.class);
 
     private static final int STDERR_TAIL = 20;
@@ -432,6 +434,16 @@ class ClaudeCliSession {
     }
 
     /**
+     * Switches the permission mode of the running session - the plan mode, for one.
+     */
+    CompletableFuture<?> setPermissionMode(ClaudePermissionMode mode) {
+        JsonObject request = new JsonObject();
+        request.addProperty("subtype", "set_permission_mode");
+        request.addProperty("mode", mode.getCliMode());
+        return controlRequest(request);
+    }
+
+    /**
      * A control request of ours, answered by a {@code control_response} with the same id.
      */
     private CompletableFuture<JsonObject> controlRequest(JsonObject request) {
@@ -533,6 +545,14 @@ class ClaudeCliSession {
             if (ClaudeToolCalls.PLAN_TOOLS.contains(name)) {
                 onPlanTool(toolUse, listener);
                 continue;
+            }
+            // the plan of the plan mode is a file - the chat opens it for review
+            if (EXIT_PLAN_MODE.equals(name) && listener != null) {
+                JsonObject input = toolUse.get("input") instanceof JsonObject object ? object : new JsonObject();
+                String planFile = string(input, "planFilePath");
+                if (!planFile.isEmpty()) {
+                    listener.onPlanFile(Path.of(planFile));
+                }
             }
             if (ClaudeToolCalls.HIDDEN_TOOLS.contains(name)) {
                 continue;

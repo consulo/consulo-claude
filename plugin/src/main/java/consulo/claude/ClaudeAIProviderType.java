@@ -32,6 +32,8 @@ import consulo.ai.AIProviderTypeWithChats;
 import consulo.ai.AIRequest;
 import consulo.ai.AIResponse;
 import consulo.ai.AIRole;
+import consulo.ai.AISessionOption;
+import consulo.ai.AISessionOptionValue;
 import consulo.ai.AIStreamListener;
 import consulo.annotation.component.ExtensionImpl;
 import consulo.application.concurrent.ApplicationConcurrency;
@@ -72,6 +74,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 @ExtensionImpl
 @Singleton
 public class ClaudeAIProviderType implements AIProviderTypeWithChats {
+    private static final String MODE_OPTION = "mode";
+
     public static final String ID = "claude";
 
     private static final Logger LOG = Logger.getInstance(ClaudeAIProviderType.class);
@@ -104,6 +108,10 @@ public class ClaudeAIProviderType implements AIProviderTypeWithChats {
      * A session being copied for a chat which started over - its next prompt waits for the copy.
      */
     private final Map<String, CompletableFuture<?>> myForks = new ConcurrentHashMap<>();
+    /**
+     * The permission mode a chat chose - the account's until it chooses one.
+     */
+    private final Map<String, ClaudePermissionMode> myModes = new ConcurrentHashMap<>();
     private volatile List<AIModel> myModels = FALLBACK_MODELS;
     private volatile @Nullable CompletableFuture<List<AIModel>> myModelsLoading;
 
@@ -333,10 +341,47 @@ public class ClaudeAIProviderType implements AIProviderTypeWithChats {
         }
     }
 
+    /**
+     * The permission mode as the mode of the chat - plan mode included.
+     */
+    @Override
+    public List<AISessionOption> getSessionOptions(AIProvider provider, String sessionId) {
+        ClaudePermissionMode current = myModes.getOrDefault(key(provider, sessionId), ClaudePermissionMode.of(provider));
+        List<AISessionOptionValue> values = new ArrayList<>();
+        for (ClaudePermissionMode mode : ClaudePermissionMode.values()) {
+            values.add(new AISessionOptionValue(mode.getId(), mode.getShortName().get(), mode.getDisplayName().get()));
+        }
+        return List.of(new AISessionOption(MODE_OPTION, ClaudeLocalize.optionMode().get(), null, AISessionOption.CATEGORY_MODE,
+            "select", current.getId(), values));
+    }
+
+    /**
+     * A running session switches at once, a new one starts in the mode.
+     */
+    @Override
+    public CompletableFuture<List<AISessionOption>> setSessionOption(AIProvider provider, String sessionId, String optionId, String value) {
+        if (!MODE_OPTION.equals(optionId)) {
+            return AIProviderTypeWithChats.super.setSessionOption(provider, sessionId, optionId, value);
+        }
+        String key = key(provider, sessionId);
+        ClaudePermissionMode mode = ClaudePermissionMode.ofId(value);
+        ClaudeCliSession session = mySessions.get(key);
+        CompletableFuture<?> applied = session == null ? CompletableFuture.completedFuture(null) : session.setPermissionMode(mode);
+        return applied.thenApply(ignored -> {
+            myModes.put(key, mode);
+            List<AISessionOption> options = getSessionOptions(provider, sessionId);
+            for (AIChatSessionListener listener : mySessionListeners.getOrDefault(key, List.of())) {
+                listener.optionsChanged(options);
+            }
+            return options;
+        });
+    }
+
     @Override
     public void addSessionListener(AIProvider provider, String sessionId, AIChatSessionListener listener, Disposable parentDisposable) {
         String key = key(provider, sessionId);
         mySessionListeners.computeIfAbsent(key, id -> new CopyOnWriteArrayList<>()).add(listener);
+        listener.optionsChanged(getSessionOptions(provider, sessionId));
         Disposer.register(parentDisposable, () -> {
             List<AIChatSessionListener> listeners = mySessionListeners.get(key);
             if (listeners != null) {
@@ -389,7 +434,7 @@ public class ClaudeAIProviderType implements AIProviderTypeWithChats {
             workingDirectory != null ? workingDirectory : Platform.current().user().homePath(),
             authMode,
             secret,
-            ClaudePermissionMode.of(provider),
+            sessionId == null ? ClaudePermissionMode.of(provider) : myModes.getOrDefault(key(provider, sessionId), ClaudePermissionMode.of(provider)),
             sessionId,
             request.getEffort()
         );

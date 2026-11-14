@@ -76,3 +76,17 @@ effort.xhigh:
     text: Extra high
 effort.max:
     text: Max
+option.mode:
+    text: Mode
+permission.mode.manual.short:
+    text: Ask
+permission.mode.accept.edits.short:
+    text: Accept Edits
+permission.mode.plan.short:
+    text: Plan
+permission.mode.auto.short:
+    text: Auto
+permission.mode.dont.ask.short:
+    text: Don't Ask
+permission.mode.bypass.short:
+    text: Bypass

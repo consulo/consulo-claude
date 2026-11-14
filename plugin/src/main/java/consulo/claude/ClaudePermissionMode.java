@@ -29,25 +29,49 @@ import java.util.Map;
  * @since 2026-10-13
  */
 enum ClaudePermissionMode {
-    MANUAL("manual", ClaudeLocalize.permissionModeManual()),
-    ACCEPT_EDITS("acceptEdits", ClaudeLocalize.permissionModeAcceptEdits()),
-    PLAN("plan", ClaudeLocalize.permissionModePlan()),
-    AUTO("auto", ClaudeLocalize.permissionModeAuto()),
-    DONT_ASK("dontAsk", ClaudeLocalize.permissionModeDontAsk()),
-    BYPASS("bypassPermissions", ClaudeLocalize.permissionModeBypass());
+    MANUAL("manual", ClaudeLocalize.permissionModeManualShort(), ClaudeLocalize.permissionModeManual()),
+    ACCEPT_EDITS("acceptEdits", ClaudeLocalize.permissionModeAcceptEditsShort(), ClaudeLocalize.permissionModeAcceptEdits()),
+    PLAN("plan", ClaudeLocalize.permissionModePlanShort(), ClaudeLocalize.permissionModePlan()),
+    AUTO("auto", ClaudeLocalize.permissionModeAutoShort(), ClaudeLocalize.permissionModeAuto()),
+    DONT_ASK("dontAsk", ClaudeLocalize.permissionModeDontAskShort(), ClaudeLocalize.permissionModeDontAsk()),
+    BYPASS("bypassPermissions", ClaudeLocalize.permissionModeBypassShort(), ClaudeLocalize.permissionModeBypass());
 
     static final String OPTION = "permissionMode";
 
     private final String myId;
+    private final LocalizeValue myShortName;
     private final LocalizeValue myDisplayName;
 
-    ClaudePermissionMode(String id, LocalizeValue displayName) {
+    ClaudePermissionMode(String id, LocalizeValue shortName, LocalizeValue displayName) {
         myId = id;
+        myShortName = shortName;
         myDisplayName = displayName;
+    }
+
+    /**
+     * The name on the mode button of a chat - the display name tells what the mode does.
+     */
+    LocalizeValue getShortName() {
+        return myShortName;
     }
 
     LocalizeValue getDisplayName() {
         return myDisplayName;
+    }
+
+    String getId() {
+        return myId;
+    }
+
+    /**
+     * The name the command line knows the mode by, for a switch of a running session.
+     */
+    String getCliMode() {
+        return this == MANUAL ? "default" : myId;
+    }
+
+    static ClaudePermissionMode ofId(String id) {
+        return of(Map.of(OPTION, id));
     }
 
     List<String> getParameters() {
