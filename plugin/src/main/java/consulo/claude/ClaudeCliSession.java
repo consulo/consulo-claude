@@ -15,14 +15,25 @@
  */
 package consulo.claude;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import consulo.ai.AIContent;
+import consulo.ai.AIContextUsage;
+import consulo.ai.AIMcpServer;
+import consulo.ai.AIMcpServerProvider;
 import consulo.ai.AIMessage;
+import consulo.ai.AIPlanEntry;
+import consulo.ai.AIPlanEntryPriority;
+import consulo.ai.AIPlanEntryStatus;
 import consulo.ai.AIResponse;
+import consulo.ai.AIRole;
 import consulo.ai.AIStopReason;
 import consulo.ai.AIStreamListener;
 import consulo.ai.AIUsage;
+import consulo.application.Application;
+import consulo.localize.LocalizeValue;
 import consulo.logging.Logger;
 import consulo.process.ExecutionException;
 import consulo.process.ProcessHandler;
@@ -40,12 +51,16 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Deque;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
+import java.util.regex.Matcher;
 
 /**
  * One conversation with the claude command line: a single long-lived {@code claude -p} process speaking stream-json,
@@ -59,22 +74,43 @@ class ClaudeCliSession {
     private static final Logger LOG = Logger.getInstance(ClaudeCliSession.class);
 
     private static final int STDERR_TAIL = 20;
+    private static final Pattern TASK_CREATED = Pattern.compile("Task #(\\S+) created");
 
-    private record Turn(CompletableFuture<AIResponse> result, @Nullable AIStreamListener listener, StringBuilder text) {
+    private record Turn(CompletableFuture<AIResponse> result,
+                        @Nullable AIStreamListener listener,
+                        StringBuilder text,
+                        StringBuilder thinking,
+                        Map<String, AIContent.ToolCall> toolCalls,
+                        Map<String, String> toolNames) {
+        Turn(CompletableFuture<AIResponse> result, @Nullable AIStreamListener listener) {
+            this(result, listener, new StringBuilder(), new StringBuilder(), new LinkedHashMap<>(), new ConcurrentHashMap<>());
+        }
     }
 
     private final ProcessHandler myHandler;
+    private final Path myWorkingDirectory;
+    /**
+     * The tasks the command line keeps for the session ({@code TaskCreate} / {@code TaskUpdate}), by their id - the
+     * plan of the chat.
+     */
+    private final Map<String, AIPlanEntry> myTasks = new LinkedHashMap<>();
+    /**
+     * A {@code TaskCreate} until its result tells the id of the task.
+     */
+    private final Map<String, String> myPendingTasks = new ConcurrentHashMap<>();
     private final StringBuilder myLine = new StringBuilder();
     private final Deque<String> myStderr = new ArrayDeque<>();
     private final ClaudeControlHandler myControlHandler = new ClaudeControlHandler(this::write, this::currentListener);
 
     private @Nullable Turn myTurn;
+    private boolean myFresh;
     private @Nullable String myCliSessionId;
     private final Map<String, CompletableFuture<JsonObject>> myControlRequests = new ConcurrentHashMap<>();
     private boolean myTitleAsked;
 
-    private ClaudeCliSession(ProcessHandler handler) {
+    private ClaudeCliSession(ProcessHandler handler, Path workingDirectory) {
         myHandler = handler;
+        myWorkingDirectory = workingDirectory;
     }
 
     /**
@@ -109,9 +145,15 @@ class ClaudeCliSession {
             parameters.add("--effort");
             parameters.add(effort);
         }
+        boolean resumed = sessionId != null && ClaudeChats.exists(workDirectory, sessionId);
         if (sessionId != null) {
-            parameters.add(ClaudeChats.exists(workDirectory, sessionId) ? "--resume" : "--session-id");
+            parameters.add(resumed ? "--resume" : "--session-id");
             parameters.add(sessionId);
+        }
+        String mcpConfig = mcpConfig();
+        if (mcpConfig != null) {
+            parameters.add("--mcp-config");
+            parameters.add(mcpConfig);
         }
 
         GeneralCommandLine commandLine = new GeneralCommandLine()
@@ -124,8 +166,9 @@ class ClaudeCliSession {
             commandLine.withEnvironment(variable, secret.strip());
         }
 
-        ProcessHandler handler = factory.newBuilder(commandLine).killable().build();
-        ClaudeCliSession session = new ClaudeCliSession(handler);
+        ProcessHandler handler = factory.newBuilder(commandLine).killable().silentReader().build();
+        ClaudeCliSession session = new ClaudeCliSession(handler, workDirectory);
+        session.myFresh = sessionId != null && !resumed;
         handler.addProcessListener(new ProcessListener() {
             @Override
             public void onTextAvailable(ProcessEvent event, Key outputType) {
@@ -146,7 +189,49 @@ class ClaudeCliSession {
         return session;
     }
 
+    /**
+     * The MCP servers of the IDE as the command line takes them - the model searches and navigates with the indexes of
+     * the IDE through them. Null while there are none.
+     */
+    private static @Nullable String mcpConfig() {
+        JsonObject servers = new JsonObject();
+        Application.get().getExtensionPoint(AIMcpServerProvider.class).forEach(provider -> {
+            for (AIMcpServer server : provider.getServers()) {
+                JsonObject entry = new JsonObject();
+                entry.addProperty("type", "http");
+                entry.addProperty("url", server.url());
+                JsonObject headers = new JsonObject();
+                server.headers().forEach(headers::addProperty);
+                entry.add("headers", headers);
+                servers.add(server.name(), entry);
+            }
+        });
+        if (servers.isEmpty()) {
+            return null;
+        }
+        JsonObject config = new JsonObject();
+        config.add("mcpServers", servers);
+        return config.toString();
+    }
+
+    /**
+     * True for the first prompt of a session the command line did not keep - it knows nothing of the chat yet.
+     */
+    synchronized boolean takeFresh() {
+        boolean fresh = myFresh;
+        myFresh = false;
+        return fresh;
+    }
+
     synchronized CompletableFuture<AIResponse> send(String text, @Nullable AIStreamListener listener) {
+        return send(List.of(AIContent.text(text)), listener);
+    }
+
+    /**
+     * Sends a message of the user - its text, images, and the files and selections it carries, which the command line
+     * takes as text: it has no blocks for them.
+     */
+    synchronized CompletableFuture<AIResponse> send(List<AIContent> content, @Nullable AIStreamListener listener) {
         if (myTurn != null) {
             return CompletableFuture.failedFuture(new IllegalStateException("The previous answer has not finished yet"));
         }
@@ -154,12 +239,12 @@ class ClaudeCliSession {
             return CompletableFuture.failedFuture(new IOException("claude exited: " + stderrTail()));
         }
 
-        Turn turn = new Turn(new CompletableFuture<>(), listener, new StringBuilder());
+        Turn turn = new Turn(new CompletableFuture<>(), listener);
         myTurn = turn;
 
         JsonObject message = new JsonObject();
         message.addProperty("role", "user");
-        message.addProperty("content", text);
+        message.add("content", blocks(content));
         JsonObject line = new JsonObject();
         line.addProperty("type", "user");
         line.add("message", message);
@@ -172,6 +257,50 @@ class ClaudeCliSession {
             return CompletableFuture.failedFuture(e);
         }
         return turn.result();
+    }
+
+    private static JsonArray blocks(List<AIContent> content) {
+        JsonArray blocks = new JsonArray();
+        // the text of a selection goes after everything else, its link stays in place
+        List<String> contexts = new ArrayList<>();
+        for (AIContent part : content) {
+            JsonObject block = new JsonObject();
+            switch (part) {
+                case AIContent.Text text -> {
+                    block.addProperty("type", "text");
+                    block.addProperty("text", text.text());
+                }
+                case AIContent.Image image -> {
+                    JsonObject source = new JsonObject();
+                    source.addProperty("type", "base64");
+                    source.addProperty("media_type", image.mediaType());
+                    source.addProperty("data", Base64.getEncoder().encodeToString(image.data()));
+                    block.addProperty("type", "image");
+                    block.add("source", source);
+                }
+                case AIContent.ResourceLink link -> {
+                    block.addProperty("type", "text");
+                    block.addProperty("text", "[@" + link.name() + "](" + link.uri() + ")");
+                }
+                case AIContent.Resource resource -> {
+                    String uri = resource.uri();
+                    block.addProperty("type", "text");
+                    block.addProperty("text", "[@" + uri.substring(uri.lastIndexOf('/') + 1) + "](" + uri + ")");
+                    contexts.add("\n<context ref=\"" + uri + "\">\n" + resource.text() + "\n</context>");
+                }
+                default -> {
+                    continue;
+                }
+            }
+            blocks.add(block);
+        }
+        for (String context : contexts) {
+            JsonObject block = new JsonObject();
+            block.addProperty("type", "text");
+            block.addProperty("text", context);
+            blocks.add(block);
+        }
+        return blocks;
     }
 
     private void write(JsonObject line) throws IOException {
@@ -245,8 +374,13 @@ class ClaudeCliSession {
                 if (!sessionId.isEmpty()) {
                     myCliSessionId = sessionId;
                 }
+                if ("task_summary".equals(string(event, "subtype"))) {
+                    onTaskSummary(string(event, "detail"));
+                }
             }
             case "stream_event" -> onStreamEvent(event.getAsJsonObject("event"));
+            case "assistant" -> onAssistant(event);
+            case "user" -> onUser(event);
             case "result" -> onResult(event);
             case "control_request" -> myControlHandler.onRequest(event);
             case "control_cancel_request" -> myControlHandler.onCancel(event);
@@ -355,12 +489,161 @@ class ClaudeCliSession {
                 }
             }
             case "thinking_delta" -> {
+                String thinking = string(delta, "thinking");
+                turn.thinking().append(thinking);
                 if (listener != null) {
-                    listener.onThinkingDelta(string(delta, "thinking"));
+                    listener.onThinkingDelta(thinking);
                 }
             }
             default -> {
             }
+        }
+    }
+
+    /**
+     * What the command line is busy with - told as the status of the answer.
+     */
+    private void onTaskSummary(String detail) {
+        AIStreamListener listener = currentListener();
+        if (listener != null && !detail.isBlank()) {
+            listener.onStatus(LocalizeValue.of(detail));
+        }
+    }
+
+    /**
+     * A message of the model, whole - its text came as stream events already, its tool calls start here.
+     */
+    private void onAssistant(JsonObject event) {
+        Turn turn = myTurn;
+        JsonObject message = ClaudeToolCalls.object(event, "message");
+        JsonElement content = message.get("content");
+        if (turn == null || content == null || !content.isJsonArray()) {
+            return;
+        }
+        String parentId = string(event, "parent_tool_use_id");
+        AIStreamListener listener = turn.listener();
+        for (JsonElement element : content.getAsJsonArray()) {
+            if (!element.isJsonObject() || !"tool_use".equals(string(element.getAsJsonObject(), "type"))) {
+                continue;
+            }
+            JsonObject toolUse = element.getAsJsonObject();
+            String name = string(toolUse, "name");
+            String id = string(toolUse, "id");
+            turn.toolNames().put(id, name);
+            if (ClaudeToolCalls.PLAN_TOOLS.contains(name)) {
+                onPlanTool(toolUse, listener);
+                continue;
+            }
+            if (ClaudeToolCalls.HIDDEN_TOOLS.contains(name)) {
+                continue;
+            }
+            AIContent.ToolCall call = ClaudeToolCalls.started(toolUse, parentId.isEmpty() ? null : parentId, myWorkingDirectory);
+            synchronized (turn) {
+                turn.toolCalls().put(id, call);
+            }
+            if (listener != null) {
+                listener.onToolCall(call);
+            }
+        }
+    }
+
+    /**
+     * The results of the tools - a user message the command line writes itself.
+     */
+    private void onUser(JsonObject event) {
+        Turn turn = myTurn;
+        JsonObject message = ClaudeToolCalls.object(event, "message");
+        JsonElement content = message.get("content");
+        if (turn == null || content == null || !content.isJsonArray()) {
+            return;
+        }
+        AIStreamListener listener = turn.listener();
+        JsonElement toolUseResult = event.get("tool_use_result");
+        for (JsonElement element : content.getAsJsonArray()) {
+            if (!element.isJsonObject() || !"tool_result".equals(string(element.getAsJsonObject(), "type"))) {
+                continue;
+            }
+            JsonObject toolResult = element.getAsJsonObject();
+            String id = string(toolResult, "tool_use_id");
+            String name = turn.toolNames().getOrDefault(id, "");
+            if ("TaskCreate".equals(name)) {
+                JsonElement resultContent = toolResult.get("content");
+                onTaskCreated(id, resultContent != null && resultContent.isJsonPrimitive() ? resultContent.getAsString() : "", toolUseResult, listener);
+                continue;
+            }
+            AIContent.ToolCall finished;
+            synchronized (turn) {
+                AIContent.ToolCall call = turn.toolCalls().get(id);
+                if (call == null) {
+                    continue;
+                }
+                finished = ClaudeToolCalls.finished(call, name, toolResult, toolUseResult);
+                turn.toolCalls().put(id, finished);
+            }
+            if (listener != null) {
+                listener.onToolCall(finished);
+            }
+        }
+    }
+
+    private void onPlanTool(JsonObject toolUse, @Nullable AIStreamListener listener) {
+        List<AIPlanEntry> todos = ClaudeToolCalls.todos(toolUse);
+        if (todos != null) {
+            if (listener != null) {
+                listener.onPlan(todos);
+            }
+            return;
+        }
+        JsonObject input = ClaudeToolCalls.object(toolUse, "input");
+        switch (string(toolUse, "name")) {
+            case "TaskCreate" -> myPendingTasks.put(string(toolUse, "id"), string(input, "subject"));
+            case "TaskUpdate" -> {
+                String taskId = string(input, "taskId").isEmpty() ? string(input, "id") : string(input, "taskId");
+                List<AIPlanEntry> plan;
+                synchronized (myTasks) {
+                    AIPlanEntry task = myTasks.get(taskId);
+                    if (task == null) {
+                        return;
+                    }
+                    String subject = string(input, "subject");
+                    String status = string(input, "status");
+                    myTasks.put(taskId, new AIPlanEntry(
+                        subject.isEmpty() ? task.content() : subject,
+                        task.priority(),
+                        status.isEmpty() ? task.status() : ClaudeToolCalls.status(status)
+                    ));
+                    plan = List.copyOf(myTasks.values());
+                }
+                if (listener != null) {
+                    listener.onPlan(plan);
+                }
+            }
+            default -> {
+            }
+        }
+    }
+
+    private void onTaskCreated(String toolUseId, String resultText, @Nullable JsonElement toolUseResult, @Nullable AIStreamListener listener) {
+        String subject = myPendingTasks.remove(toolUseId);
+        JsonObject task = toolUseResult != null && toolUseResult.isJsonObject()
+            ? ClaudeToolCalls.object(toolUseResult.getAsJsonObject(), "task")
+            : new JsonObject();
+        String taskId = string(task, "id");
+        if (taskId.isEmpty()) {
+            // older command lines tell the id in the text only: "Task #1 created successfully: ..."
+            Matcher matcher = TASK_CREATED.matcher(resultText);
+            taskId = matcher.find() ? matcher.group(1) : "";
+        }
+        if (subject == null || taskId.isEmpty()) {
+            return;
+        }
+        List<AIPlanEntry> plan;
+        synchronized (myTasks) {
+            myTasks.put(taskId, new AIPlanEntry(subject, AIPlanEntryPriority.MEDIUM, AIPlanEntryStatus.PENDING));
+            plan = List.copyOf(myTasks.values());
+        }
+        if (listener != null) {
+            listener.onPlan(plan);
         }
     }
 
@@ -383,7 +666,20 @@ class ClaudeCliSession {
         }
 
         String text = turn.text().isEmpty() ? result : turn.text().toString();
-        turn.result().complete(new AIResponse(AIMessage.assistant(text), AIStopReason.END_TURN, usage(event.getAsJsonObject("usage"))));
+        AIStreamListener listener = turn.listener();
+        AIContextUsage contextUsage = contextUsage(event);
+        if (listener != null && contextUsage != null) {
+            listener.onContextUsage(contextUsage);
+        }
+        List<AIContent> content = new ArrayList<>();
+        if (!turn.thinking().isEmpty()) {
+            content.add(AIContent.thinking(turn.thinking().toString()));
+        }
+        content.add(AIContent.text(text));
+        synchronized (turn) {
+            content.addAll(turn.toolCalls().values());
+        }
+        turn.result().complete(new AIResponse(new AIMessage(AIRole.ASSISTANT, content), AIStopReason.END_TURN, usage(event.getAsJsonObject("usage"))));
     }
 
     private void onTerminated(int exitCode) {
@@ -405,6 +701,35 @@ class ClaudeCliSession {
 
     private synchronized String stderrTail() {
         return myStderr.isEmpty() ? "no output" : String.join("\n", myStderr);
+    }
+
+    /**
+     * How full the context window of the model is after the turn - the prompt of the last request of the turn, out of
+     * the window of the model, with what the turn cost.
+     */
+    private static @Nullable AIContextUsage contextUsage(JsonObject event) {
+        JsonObject usage = ClaudeToolCalls.object(event, "usage");
+        JsonElement iterations = usage.get("iterations");
+        JsonObject last = usage;
+        if (iterations != null && iterations.isJsonArray() && !iterations.getAsJsonArray().isEmpty()) {
+            JsonElement element = iterations.getAsJsonArray().get(iterations.getAsJsonArray().size() - 1);
+            if (element.isJsonObject()) {
+                last = element.getAsJsonObject();
+            }
+        }
+        long used = integer(last, "input_tokens") + integer(last, "cache_read_input_tokens")
+            + integer(last, "cache_creation_input_tokens") + integer(last, "output_tokens");
+        long size = 0;
+        for (Map.Entry<String, JsonElement> model : ClaudeToolCalls.object(event, "modelUsage").entrySet()) {
+            if (model.getValue().isJsonObject()) {
+                size = Math.max(size, integer(model.getValue().getAsJsonObject(), "contextWindow"));
+            }
+        }
+        if (size <= 0 || used <= 0) {
+            return null;
+        }
+        JsonElement cost = event.get("total_cost_usd");
+        return new AIContextUsage(used, size, cost != null && cost.isJsonPrimitive() ? cost.getAsDouble() : null, "USD");
     }
 
     private static AIUsage usage(@Nullable JsonObject usage) {

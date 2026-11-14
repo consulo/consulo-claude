@@ -19,6 +19,8 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import consulo.ai.AIChatCarryover;
+import consulo.ai.AIChatHiddenContext;
 import consulo.ai.AIChatInfo;
 import consulo.ai.AIContent;
 import consulo.ai.AIMessage;
@@ -39,9 +41,12 @@ import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 /**
@@ -65,6 +70,8 @@ final class ClaudeChats {
     private static final int HEAD_BYTES = 256 * 1024;
     private static final int TAIL_BYTES = 512 * 1024;
     private static final int MAX_RESULT_LENGTH = 4000;
+    private static final Pattern LINK = Pattern.compile("\\[@(.+?)]\\((\\S+)\\)");
+    private static final Pattern CONTEXT = Pattern.compile("\\s*<context ref=\"([^\"]+)\">\\n(.*)\\n</context>\\s*", Pattern.DOTALL);
 
     private record CachedInfo(long size, long modified, @Nullable AIChatInfo info) {
     }
@@ -143,6 +150,9 @@ final class ClaudeChats {
             return List.of();
         }
         List<AIMessage> messages = new ArrayList<>();
+        // where each tool call sits - its result comes in a later message
+        Map<String, int[]> calls = new HashMap<>();
+        Map<String, String> names = new HashMap<>();
         try (BufferedReader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
             String line;
             while ((line = reader.readLine()) != null) {
@@ -150,7 +160,13 @@ final class ClaudeChats {
                     continue;
                 }
                 JsonObject record = parse(line);
-                AIMessage message = record == null ? null : message(record);
+                if (record == null) {
+                    continue;
+                }
+                AIMessage message = message(record);
+                if (message != null) {
+                    message = toolCalls(record, message, messages, calls, names);
+                }
                 if (message != null) {
                     messages.add(message);
                 }
@@ -159,7 +175,74 @@ final class ClaudeChats {
         catch (IOException | UncheckedIOException e) {
             LOG.warn("Cannot read the chat " + file, e);
         }
-        return messages;
+        return AIChatCarryover.strip(turns(messages));
+    }
+
+    /**
+     * One answer a turn, as the chat shows it while it is written - the command line keeps a record for every request
+     * the model made in the turn.
+     */
+    private static List<AIMessage> turns(List<AIMessage> messages) {
+        List<AIMessage> turns = new ArrayList<>(messages.size());
+        for (AIMessage message : messages) {
+            AIMessage last = turns.isEmpty() ? null : turns.getLast();
+            if (last != null && last.role() == AIRole.ASSISTANT && message.role() == AIRole.ASSISTANT) {
+                List<AIContent> content = new ArrayList<>(last.content());
+                content.addAll(message.content());
+                turns.set(turns.size() - 1, new AIMessage(AIRole.ASSISTANT, content));
+            }
+            else {
+                turns.add(message);
+            }
+        }
+        return turns;
+    }
+
+    /**
+     * The tools of a message as the chat shows them - a call of the model becomes a tool call, its result ends it in
+     * the message it was made in and leaves the message of the results. Null when nothing of the message is left.
+     */
+    private static @Nullable AIMessage toolCalls(JsonObject record,
+                                                 AIMessage message,
+                                                 List<AIMessage> messages,
+                                                 Map<String, int[]> calls,
+                                                 Map<String, String> names) {
+        Path workingDirectory = Path.of(string(record, "cwd").isEmpty() ? "/" : string(record, "cwd"));
+        List<AIContent> content = new ArrayList<>();
+        for (AIContent part : message.content()) {
+            switch (part) {
+                case AIContent.ToolUse toolUse -> {
+                    names.put(toolUse.id(), toolUse.toolName());
+                    if (ClaudeToolCalls.PLAN_TOOLS.contains(toolUse.toolName()) || ClaudeToolCalls.HIDDEN_TOOLS.contains(toolUse.toolName())) {
+                        continue;
+                    }
+                    JsonObject block = new JsonObject();
+                    block.addProperty("id", toolUse.id());
+                    block.addProperty("name", toolUse.toolName());
+                    block.add("input", ClaudeToolCalls.parse(toolUse.argumentsJson()));
+                    calls.put(toolUse.id(), new int[]{messages.size(), content.size()});
+                    content.add(ClaudeToolCalls.started(block, null, workingDirectory));
+                }
+                case AIContent.ToolResult result -> {
+                    int[] position = calls.remove(result.toolUseId());
+                    if (position == null || position[0] >= messages.size()) {
+                        continue;
+                    }
+                    AIMessage owner = messages.get(position[0]);
+                    List<AIContent> ownerContent = new ArrayList<>(owner.content());
+                    if (!(ownerContent.get(position[1]) instanceof AIContent.ToolCall call)) {
+                        continue;
+                    }
+                    JsonObject toolResult = new JsonObject();
+                    toolResult.addProperty("content", result.content());
+                    toolResult.addProperty("is_error", result.error());
+                    ownerContent.set(position[1], ClaudeToolCalls.finished(call, names.getOrDefault(result.toolUseId(), ""), toolResult, record.get("toolUseResult")));
+                    messages.set(position[0], new AIMessage(owner.role(), ownerContent));
+                }
+                default -> content.add(part);
+            }
+        }
+        return content.isEmpty() ? null : new AIMessage(message.role(), content);
     }
 
     /**
@@ -175,6 +258,71 @@ final class ClaudeChats {
         record.addProperty("customTitle", title);
         record.addProperty("sessionId", sessionId);
         Files.writeString(file, record + "\n", StandardCharsets.UTF_8, StandardOpenOption.APPEND);
+    }
+
+    /**
+     * Copies the session up to the prompt the user sent as the {@code keptPrompts + 1}-th - what came from there on is
+     * left out - as the session {@code newSessionId}, which the command line then resumes. The command line can not go
+     * back in a session itself.
+     *
+     * @return false when the session is not there to copy
+     */
+    static boolean fork(String sessionId, String newSessionId, int keptPrompts) throws IOException {
+        Path file = file(sessionId);
+        if (file == null) {
+            return false;
+        }
+        List<String> kept = new ArrayList<>();
+        int prompts = 0;
+        for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
+            JsonObject record = parse(line);
+            if (record == null) {
+                continue;
+            }
+            if (isPrompt(record)) {
+                if (prompts == keptPrompts) {
+                    break;
+                }
+                prompts++;
+            }
+            // titles are of the session copied from - the new one titles itself
+            String type = string(record, "type");
+            if ("custom-title".equals(type) || "ai-title".equals(type) || "summary".equals(type)) {
+                continue;
+            }
+            if (record.has("sessionId")) {
+                record.addProperty("sessionId", newSessionId);
+            }
+            kept.add(record.toString());
+        }
+        Files.write(file.resolveSibling(newSessionId + EXTENSION), kept, StandardCharsets.UTF_8);
+        return true;
+    }
+
+    /**
+     * A message the user wrote - not one the command line writes itself, as the results of tools.
+     */
+    private static boolean isPrompt(JsonObject record) {
+        if (!"user".equals(string(record, "type")) || isSidechain(record) || bool(record, "isMeta")) {
+            return false;
+        }
+        JsonElement message = record.get("message");
+        if (message == null || !message.isJsonObject()) {
+            return false;
+        }
+        JsonElement content = message.getAsJsonObject().get("content");
+        if (content != null && content.isJsonPrimitive()) {
+            return !content.getAsString().isBlank();
+        }
+        if (content == null || !content.isJsonArray()) {
+            return false;
+        }
+        for (JsonElement block : content.getAsJsonArray()) {
+            if (block.isJsonObject() && "text".equals(string(block.getAsJsonObject(), "type"))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static void delete(String sessionId) throws IOException {
@@ -233,7 +381,7 @@ final class ClaudeChats {
             }
             if (firstPrompt == null && user) {
                 AIMessage message = message(record);
-                String text = message == null ? "" : message.getText().strip();
+                String text = message == null ? "" : AIChatHiddenContext.strip(message.getText()).strip();
                 if (!text.isEmpty() && !text.startsWith("<")) {
                     firstPrompt = firstLine(text);
                 }
@@ -345,7 +493,7 @@ final class ClaudeChats {
                 }
                 JsonObject block = blockElement.getAsJsonObject();
                 switch (string(block, "type")) {
-                    case "text" -> content.add(AIContent.text(string(block, "text")));
+                    case "text" -> content.add(textBlock(string(block, "text")));
                     case "tool_use" -> {
                         JsonElement input = block.get("input");
                         content.add(AIContent.toolUse(string(block, "id"), string(block, "name"), input == null ? "{}" : input.toString()));
@@ -361,6 +509,22 @@ final class ClaudeChats {
             }
         }
         return content.isEmpty() ? null : new AIMessage(role, content);
+    }
+
+    /**
+     * A text block of a prompt - the files and selections the chat attached go as text blocks of their own and come
+     * back as attachments.
+     */
+    private static AIContent textBlock(String text) {
+        Matcher link = LINK.matcher(text);
+        if (link.matches()) {
+            return AIContent.resourceLink(link.group(2), link.group(1), null);
+        }
+        Matcher context = CONTEXT.matcher(text);
+        if (context.matches()) {
+            return AIContent.resource(context.group(1), null, context.group(2));
+        }
+        return AIContent.text(text);
     }
 
     /**

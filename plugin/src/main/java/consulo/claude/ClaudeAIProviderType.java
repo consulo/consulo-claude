@@ -21,7 +21,9 @@ import consulo.accountManagement.AccountAuthorizeType;
 import consulo.accountManagement.AccountCredentials;
 import consulo.accountManagement.AccountManager;
 import consulo.accountManagement.AccountType;
+import consulo.ai.AIChatCarryover;
 import consulo.ai.AIChatInfo;
+import consulo.ai.AIChatSessionListener;
 import consulo.ai.AIContent;
 import consulo.ai.AIMessage;
 import consulo.ai.AIModel;
@@ -36,11 +38,13 @@ import consulo.application.concurrent.ApplicationConcurrency;
 import consulo.claude.icon.ClaudeIconGroup;
 import consulo.claude.localize.ClaudeLocalize;
 import consulo.disposer.Disposable;
+import consulo.disposer.Disposer;
 import consulo.localize.LocalizeValue;
+import consulo.logging.Logger;
 import consulo.platform.Platform;
-import consulo.project.Project;
 import consulo.process.ExecutionException;
 import consulo.process.ProcessHandlerBuilderFactory;
+import consulo.project.Project;
 import consulo.ui.Component;
 import consulo.ui.annotation.RequiredUIAccess;
 import consulo.ui.image.Image;
@@ -50,10 +54,13 @@ import org.jspecify.annotations.Nullable;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Claude through the claude command line: it signs in on its own, keeps the conversation on its side and runs its own
@@ -66,6 +73,8 @@ import java.util.concurrent.ConcurrentHashMap;
 @Singleton
 public class ClaudeAIProviderType implements AIProviderTypeWithChats {
     public static final String ID = "claude";
+
+    private static final Logger LOG = Logger.getInstance(ClaudeAIProviderType.class);
 
     /**
      * Until the command line listed its models - the aliases it always knows.
@@ -86,6 +95,15 @@ public class ClaudeAIProviderType implements AIProviderTypeWithChats {
     private final ApplicationConcurrency myApplicationConcurrency;
     private final AccountManager myAccountManager;
     private final Map<String, ClaudeCliSession> mySessions = new ConcurrentHashMap<>();
+    /**
+     * The session of the command line a chat goes on in, when it started over - by the chat.
+     */
+    private final Map<String, String> myAliases = new ConcurrentHashMap<>();
+    private final Map<String, List<AIChatSessionListener>> mySessionListeners = new ConcurrentHashMap<>();
+    /**
+     * A session being copied for a chat which started over - its next prompt waits for the copy.
+     */
+    private final Map<String, CompletableFuture<?>> myForks = new ConcurrentHashMap<>();
     private volatile List<AIModel> myModels = FALLBACK_MODELS;
     private volatile @Nullable CompletableFuture<List<AIModel>> myModelsLoading;
 
@@ -226,13 +244,17 @@ public class ClaudeAIProviderType implements AIProviderTypeWithChats {
 
     @Override
     public CompletableFuture<AIResponse> chat(AIProvider provider, AIRequest request, @Nullable AIStreamListener listener) {
+        List<AIContent> prompt = lastUserContent(request);
         String text = lastUserText(request);
-        if (text == null) {
+        if (prompt == null || text == null) {
             return CompletableFuture.failedFuture(new IllegalArgumentException("Nothing to send - the request has no user text"));
         }
 
-        String sessionId = request.getSessionId();
-        return provider.connectAccount().thenApplyAsync(connection -> {
+        String chatId = request.getSessionId();
+        String sessionId = chatId == null ? null : myAliases.getOrDefault(key(provider, chatId), chatId);
+        CompletableFuture<?> fork = chatId == null ? null : myForks.get(key(provider, chatId));
+        CompletableFuture<?> ready = fork == null ? CompletableFuture.completedFuture(null) : fork;
+        return ready.thenCompose(ignored -> provider.connectAccount()).thenApplyAsync(connection -> {
             ClaudeCredential credential = ClaudeCredential.of(connection);
             try {
                 return sessionId == null ? start(provider, request, credential, null) : session(provider, sessionId, request, credential);
@@ -241,7 +263,17 @@ public class ClaudeAIProviderType implements AIProviderTypeWithChats {
                 throw new IllegalStateException(e.getMessage(), e);
             }
         }, myApplicationConcurrency.executor()).thenCompose(session -> {
-            CompletableFuture<AIResponse> answer = session.send(text, listener);
+            // a session which never saw the chat - it started over, or the command line lost it - is told it first
+            List<AIContent> content = prompt;
+            if (chatId != null && session.takeFresh()) {
+                String carryover = AIChatCarryover.build(request.getMessages());
+                if (carryover != null) {
+                    content = new ArrayList<>();
+                    content.add(AIContent.text(carryover));
+                    content.addAll(prompt);
+                }
+            }
+            CompletableFuture<AIResponse> answer = session.send(content, listener);
             if (sessionId == null) {
                 answer.whenComplete((response, error) -> session.close());
             }
@@ -267,6 +299,48 @@ public class ClaudeAIProviderType implements AIProviderTypeWithChats {
         session.generateTitle(description, true).whenComplete((title, error) -> {
             if (title != null) {
                 listener.onTitle(title);
+            }
+        });
+    }
+
+    /**
+     * The command line can not go back in a session - the session is copied up to the point the chat goes on from, and
+     * resumed under a new id. When there is nothing to copy the new session is told what was said instead.
+     */
+    @Override
+    public void startOver(AIProvider provider, String sessionId, List<AIMessage> history) {
+        String key = key(provider, sessionId);
+        String current = myAliases.getOrDefault(key, sessionId);
+        ClaudeCliSession session = mySessions.remove(key(provider, current));
+        if (session != null) {
+            session.close();
+        }
+        String next = UUID.randomUUID().toString();
+        myAliases.put(key, next);
+        int keptPrompts = (int) history.stream().filter(message -> message.role() == AIRole.USER && !message.getText().isBlank()).count();
+        CompletableFuture<?> fork = CompletableFuture.runAsync(() -> {
+            try {
+                ClaudeChats.fork(current, next, keptPrompts);
+            }
+            catch (IOException e) {
+                LOG.warn("Cannot copy the session " + current, e);
+            }
+        }, myApplicationConcurrency.executor());
+        myForks.put(key, fork);
+        fork.whenComplete((ignored, error) -> myForks.remove(key, fork));
+        for (AIChatSessionListener listener : mySessionListeners.getOrDefault(key, List.of())) {
+            listener.sessionChanged(next);
+        }
+    }
+
+    @Override
+    public void addSessionListener(AIProvider provider, String sessionId, AIChatSessionListener listener, Disposable parentDisposable) {
+        String key = key(provider, sessionId);
+        mySessionListeners.computeIfAbsent(key, id -> new CopyOnWriteArrayList<>()).add(listener);
+        Disposer.register(parentDisposable, () -> {
+            List<AIChatSessionListener> listeners = mySessionListeners.get(key);
+            if (listeners != null) {
+                listeners.remove(listener);
             }
         });
     }
@@ -392,6 +466,28 @@ public class ClaudeAIProviderType implements AIProviderTypeWithChats {
 
     private static String key(AIProvider provider, String sessionId) {
         return provider.getName() + "/" + sessionId;
+    }
+
+    /**
+     * What the user said last - the text, and the images, files and selections it carries.
+     */
+    private static @Nullable List<AIContent> lastUserContent(AIRequest request) {
+        List<AIMessage> messages = request.getMessages();
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            AIMessage message = messages.get(i);
+            if (message.role() != AIRole.USER) {
+                continue;
+            }
+            List<AIContent> content = new ArrayList<>();
+            for (AIContent part : message.content()) {
+                if (part instanceof AIContent.Text || part instanceof AIContent.Image
+                    || part instanceof AIContent.ResourceLink || part instanceof AIContent.Resource) {
+                    content.add(part);
+                }
+            }
+            return content.isEmpty() ? null : content;
+        }
+        return null;
     }
 
     private static @Nullable String lastUserText(AIRequest request) {
