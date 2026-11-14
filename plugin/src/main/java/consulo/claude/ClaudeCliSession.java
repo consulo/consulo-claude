@@ -167,6 +167,11 @@ class ClaudeCliSession {
             parameters.add(resumed ? "--resume" : "--session-id");
             parameters.add(sessionId);
         }
+        // the skills of the IDE for its tools, as a plugin of this session only
+        for (Path plugin : AIMcpServerProvider.skillPlugins(workDirectory, AIMcpServerProvider.AGENT_CLAUDE)) {
+            parameters.add("--plugin-dir");
+            parameters.add(plugin.toString());
+        }
         String mcpConfig = mcpConfig();
         if (mcpConfig != null) {
             parameters.add("--mcp-config");
