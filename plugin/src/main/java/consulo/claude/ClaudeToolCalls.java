@@ -256,7 +256,7 @@ final class ClaudeToolCalls {
             case "WebFetch" -> "Fetch " + string(input, "url");
             case "WebSearch" -> "Search the web for " + string(input, "query");
             case "Task", "Agent" -> string(input, "description").isEmpty() ? name : string(input, "description");
-            default -> name;
+            default -> mcpTitle(name);
         };
     }
 
@@ -302,6 +302,18 @@ final class ClaudeToolCalls {
 
     private static String truncate(String text) {
         return text.length() <= MAX_OUTPUT_LENGTH ? text : text.substring(0, MAX_OUTPUT_LENGTH) + "\u2026";
+    }
+
+    /**
+     * A tool of an MCP server is named {@code mcp__<server>__<tool>} - shown as the server and the tool, as the other
+     * agents show them.
+     */
+    private static String mcpTitle(String name) {
+        if (!name.startsWith("mcp__")) {
+            return name;
+        }
+        int separator = name.indexOf("__", "mcp__".length());
+        return separator < 0 ? name : "Tool: " + name.substring("mcp__".length(), separator) + "/" + name.substring(separator + 2);
     }
 
     private static String firstLine(String text) {
